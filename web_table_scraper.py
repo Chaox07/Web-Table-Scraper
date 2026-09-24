@@ -18,10 +18,12 @@ Features
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextlib
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -69,6 +71,28 @@ except ImportError:  # pragma: no cover
     HAVE_SELENIUM = False
 
 
+# Resolved once, at import time, while __file__ is definitely still available
+# -- an atexit callback runs at interpreter shutdown, by which point a module's
+# globals can already be torn down. Same reasoning as ETL.py's own hook.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _cleanup_pycache_dir() -> None:
+    """Same __pycache__-cleanup-on-exit pattern ETL.py's own hook uses. Running
+    this file directly leaves no bytecode behind (a __main__ script is never
+    cached), but importing it -- from a notebook, or from another script in
+    this folder -- does, and that cache would otherwise sit here forever."""
+    try:
+        pycache_dir = os.path.join(_SCRIPT_DIR, "__pycache__")
+        if os.path.isdir(pycache_dir):
+            shutil.rmtree(pycache_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+
+atexit.register(_cleanup_pycache_dir)
+
+
 # ==========================================================
 # SETTINGS -- core, edit these
 # ==========================================================
@@ -101,6 +125,11 @@ ROBOTS_CACHE_SECONDS = 3600
 CACHE_ENABLED = False
 CACHE_DIR = os.path.join(OUTPUT_DIR, ".wts_cache")
 CACHE_TTL_SECONDS = 900
+# Delete CACHE_DIR entirely when the process exits, so a run never leaves
+# scraped page bodies sitting on disk. Set False to keep the cache warm across
+# runs -- only worth it while iterating on parsing against the same URLs, and
+# it means the fetched HTML outlives the run that fetched it.
+CACHE_DELETE_ON_EXIT = True
 # endregion
 
 # region selenium (JS-rendered pages only)
@@ -286,6 +315,7 @@ class ScraperConfig:
     cache_enabled: bool = False
     cache_dir: str = ".wts_cache"
     cache_ttl_seconds: int = 900
+    cache_delete_on_exit: bool = True
 
     use_selenium_first: bool = False
     use_selenium_fallback: bool = True
@@ -452,10 +482,33 @@ class FileCache:
     timestamp, response headers and source.
     """
 
-    def __init__(self, cache_dir: str | Path, ttl_seconds: int) -> None:
+    # Response headers are stored alongside the HTML for debugging, but these
+    # carry credentials on any authenticated fetch and this cache is a
+    # plain-text JSON file on disk. Dropped at write time rather than at read
+    # time, so a secret never reaches the filesystem in the first place.
+    _SENSITIVE_HEADERS = frozenset({
+        "set-cookie", "cookie", "authorization", "proxy-authorization",
+        "www-authenticate", "proxy-authenticate", "x-api-key", "x-auth-token",
+    })
+
+    def __init__(self, cache_dir: str | Path, ttl_seconds: int,
+                 delete_on_exit: bool = True) -> None:
         self.cache_dir = Path(cache_dir)
         self.ttl_seconds = ttl_seconds
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        # Nothing else calls clear(), so without this the directory is a
+        # permanent record of every page fetched: entries are TTL-checked on
+        # READ (get_entry returns None for a stale one) but the file itself is
+        # never unlinked, so an expired entry lingers on disk indefinitely.
+        if delete_on_exit:
+            atexit.register(self.destroy)
+
+    @classmethod
+    def _scrub_headers(cls, headers: Optional[Mapping[str, str]]) -> Dict[str, str]:
+        return {
+            k: v for k, v in dict(headers or {}).items()
+            if k.lower() not in cls._SENSITIVE_HEADERS
+        }
 
     def _key_to_path(self, key: str) -> Path:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
@@ -515,7 +568,7 @@ class FileCache:
             "url": url,
             "fetched_at": time.time(),
             "status_code": status_code,
-            "headers": dict(headers or {}),
+            "headers": self._scrub_headers(headers),
             "source": source,
         }
         payload = {
@@ -523,17 +576,30 @@ class FileCache:
             "html": value,
         }
 
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=self.cache_dir,
-            delete=False,
-            suffix=".tmp",
-        ) as tmp:
-            json.dump(payload, tmp, ensure_ascii=False)
-            tmp_path = Path(tmp.name)
+        # delete=False means the file outlives the `with` block on purpose --
+        # it has to, so it can be renamed into place. But that also means
+        # nothing removes it if the write or the rename fails, and a
+        # half-written .tmp then sits in the cache dir forever (clear() only
+        # ever globbed *.json, so it could not reclaim them either). Hence the
+        # explicit unlink on every failure path.
+        tmp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=self.cache_dir,
+                delete=False,
+                suffix=".tmp",
+            ) as tmp:
+                tmp_path = Path(tmp.name)
+                json.dump(payload, tmp, ensure_ascii=False)
 
-        tmp_path.replace(path)
+            tmp_path.replace(path)
+            tmp_path = None  # renamed away -- no longer ours to clean up
+        finally:
+            if tmp_path is not None:
+                with contextlib.suppress(OSError):
+                    tmp_path.unlink()
 
     def invalidate(self, key: str) -> bool:
         path = self._key_to_path(key)
@@ -547,12 +613,30 @@ class FileCache:
     def clear(self) -> int:
         count = 0
 
-        for path in self.cache_dir.glob("*.json"):
-            with contextlib.suppress(FileNotFoundError):
-                path.unlink()
-                count += 1
+        # "*.json" and "*.tmp", not just "*.json": a .tmp orphaned by a failed
+        # set() is exactly the kind of thing a clear() is expected to reclaim,
+        # and globbing only the finished entries left them stranded.
+        for pattern in ("*.json", "*.tmp"):
+            for path in self.cache_dir.glob(pattern):
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                    count += 1
 
         return count
+
+    def destroy(self) -> None:
+        """Empty the cache and remove the directory itself. Registered as an
+        atexit hook by default so a run leaves no scraped page bodies behind;
+        best-effort, since this fires during interpreter shutdown."""
+        try:
+            self.clear()
+            with contextlib.suppress(OSError):
+                # rmdir, not rmtree: only removes the directory if this cache
+                # is all that was in it. If the user pointed CACHE_DIR at a
+                # folder holding anything else, that survives.
+                self.cache_dir.rmdir()
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -746,7 +830,8 @@ class HtmlFetcher:
         self.selenium_pool = SeleniumBrowserPool(config=config, logger=logger) if HAVE_SELENIUM else None
 
         self.cache = (
-            FileCache(config.cache_dir, config.cache_ttl_seconds)
+            FileCache(config.cache_dir, config.cache_ttl_seconds,
+                      delete_on_exit=config.cache_delete_on_exit)
             if config.cache_enabled
             else None
         )
@@ -971,7 +1056,8 @@ class AsyncHtmlFetcher:
         self.logger = logger
         self.robots_checker = robots_checker or RobotsChecker(config.robots_cache_seconds)
         self.cache = (
-            FileCache(config.cache_dir, config.cache_ttl_seconds)
+            FileCache(config.cache_dir, config.cache_ttl_seconds,
+                      delete_on_exit=config.cache_delete_on_exit)
             if config.cache_enabled
             else None
         )
@@ -2249,6 +2335,7 @@ def _build_config() -> ScraperConfig:
         cache_enabled=CACHE_ENABLED,
         cache_dir=CACHE_DIR,
         cache_ttl_seconds=CACHE_TTL_SECONDS,
+        cache_delete_on_exit=CACHE_DELETE_ON_EXIT,
         use_selenium_first=USE_SELENIUM_FIRST,
         use_selenium_fallback=USE_SELENIUM_FALLBACK,
         selenium_headless=SELENIUM_HEADLESS,

@@ -1,0 +1,10 @@
+.DS_Store
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Output and cache written beside the script (OUTPUT_DIR)
+*.duckdb
+*_hot.sqlite
+*_hot.sqlite-*
+.wts_cache/
